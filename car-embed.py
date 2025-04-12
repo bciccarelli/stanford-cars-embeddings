@@ -16,6 +16,15 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms, models
 import faiss
 
+import wandb
+
+# Initialize a new run
+wandb.init(project="stanford-cars", name="training-run")
+config = wandb.config
+config.learning_rate = 0.01
+config.batch_size = 32
+config.epochs = 10
+
 # Set random seeds for reproducibility
 def set_seed(seed=42):
     random.seed(seed)
@@ -27,39 +36,52 @@ def set_seed(seed=42):
 
 set_seed()
 
-NUM_TEST_IMG = 8041
-
+# Download latest version
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
 # 1. Data Loading and Preprocessing
 class StanfordCarsDataset(Dataset):
-    def __init__(self, root_dir, split='train', transform=None):
+    def __init__(self, root_dir, path_to_meta, split='train', transform=None):
         self.root_dir = root_dir
+        self.path_to_meta = path_to_meta
         self.transform = transform
         self.split = split
         
         # Load annotations
-        self.annotations_path = os.path.join(root_dir, 'cars_annos.mat')
-        self.annotations = scipy.io.loadmat(self.annotations_path)
+        # self.annotations_path = os.path.join(path_to_meta, 'cars_annos.mat')
+        cars_annos_test = os.path.join(self.path_to_meta, "cars_test_annos_withlabels (1).mat") 
+        cars_annos_train = os.path.join(self.path_to_meta, "devkit", "cars_train_annos.mat")
+        cars_annos_meta = os.path.join(self.path_to_meta, "devkit", "cars_meta.mat")
+        self.cars_meta_mat = scipy.io.loadmat(cars_annos_meta)
+        self.annotations_test = scipy.io.loadmat(cars_annos_test)
+        self.annotations_train = scipy.io.loadmat(cars_annos_train)
+
+        class_names = [name[0] for name in self.cars_meta_mat['class_names'][0]]
         # Process annotations
         self.samples = []
-        class_names = [name[0] for name in self.annotations['class_names'][0]]
-        for anno in self.annotations['annotations'][0]:
-            img_num = int(anno[0][0][-9:-4])
-            # is_test = int(anno[6][0][0])
-            if img_num > NUM_TEST_IMG:
-                img_num = img_num - NUM_TEST_IMG
-            
-            img_name = str(img_num).zfill(5) + ".jpg"
-            file_path = os.path.join(root_dir, 'cars_' + split, 'cars_' + split, img_name)
-            # Check if this is train or test image based on path
-            is_test = 'test' in split
-            if (self.split == 'test' and is_test) or (self.split == 'train' and not is_test):
-                class_id = int(anno[5][0][0]) - 1  # Convert to 0-indexed
-                self.samples.append((file_path, class_id))
+        if self.split == 'test':
+                    
+            for anno in self.annotations_test['annotations'][0]:
+                img_name = anno[5][0][-9:]
+                file_path = os.path.join(root_dir, 'cars_' + split, 'cars_' + split, img_name)
+                # Check if this is train or test image based on path
+                is_test = 'test' in split
+                if (self.split == 'test' and is_test) or (self.split == 'train' and not is_test):
+                    class_id = int(anno[4][0][0]) - 1  # Convert to 0-indexed
+                    self.samples.append((file_path, class_id))
         
+        elif self.split == 'train':
+            for anno in self.annotations_train['annotations'][0]:
+                img_name = anno[5][0][-9:]
+                file_path = os.path.join(root_dir, 'cars_' + split, 'cars_' + split, img_name)
+                # Check if this is train or test image based on path
+                is_test = 'test' in split
+                if (self.split == 'test' and is_test) or (self.split == 'train' and not is_test):
+                    class_id = int(anno[4][0][0]) - 1  # Convert to 0-indexed
+                    self.samples.append((file_path, class_id))
+
         self.class_names = class_names
         print(f"Loaded {len(self.samples)} {split} samples with {len(class_names)} classes")
     
@@ -236,6 +258,7 @@ def train_model(model, train_loader, criterion, optimizer, num_epochs=10):
         # Calculate average loss for the epoch
         epoch_loss = running_loss / len(train_loader)
         train_losses.append(epoch_loss)
+        wandb.log({"loss": epoch_loss, "epoch": epoch})
         print(f'Epoch {epoch+1}, Loss: {epoch_loss:.4f}')
     
     return train_losses
@@ -287,24 +310,27 @@ def show_samples(dataset, num_samples=5):
     plt.tight_layout()
     plt.show()
 
+
 # Main execution
 def main():
     # Download and set path to dataset
     path_to_stanford_cars = kagglehub.dataset_download("jessicali9530/stanford-cars-dataset")
     print(f"Dataset path: {path_to_stanford_cars}")
-    
+        
+    path_to_meta = kagglehub.dataset_download("abdelrahmant11/standford-cars-dataset-meta")
+
     # Create transforms
     train_transform, test_transform = get_transforms()
     
     # Create datasets
-    train_dataset = StanfordCarsDataset(path_to_stanford_cars, split='train', transform=train_transform)
-    test_dataset = StanfordCarsDataset(path_to_stanford_cars, split='test', transform=test_transform)
+    train_dataset = StanfordCarsDataset(path_to_stanford_cars, path_to_meta, split='train', transform=train_transform)
+    test_dataset = StanfordCarsDataset(path_to_stanford_cars, path_to_meta, split='test', transform=test_transform)
     
     # Show some sample images
-    # show_samples(train_dataset)
+    show_samples(train_dataset)
     
     # Create Siamese pairs
-    train_siamese_dataset = SiamesePairDataset(train_dataset, num_pairs=20000)
+    train_siamese_dataset = SiamesePairDataset(train_dataset, num_pairs=5000)
     
     # Create data loaders
     train_loader = DataLoader(train_siamese_dataset, batch_size=32, shuffle=True, num_workers=4)
@@ -318,7 +344,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     # Train model
-    train_losses = train_model(model, train_loader, criterion, optimizer, num_epochs=10)
+    train_losses = train_model(model, train_loader, criterion, optimizer, num_epochs=100)
     
     # Save the model
     torch.save(model.state_dict(), 'siamese_car_model.pth')
@@ -355,6 +381,8 @@ def main():
     print("Query car label:", sample_labels.item())
     print("Similar car labels:", similar_labels)
     print("Distances:", distances)
+
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
