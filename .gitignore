@@ -2,3 +2,4 @@ wandb/
 car_embeddings.pkl
 car_index.faiss
 *.pth
+*.log

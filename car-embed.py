@@ -23,7 +23,7 @@ wandb.init(project="stanford-cars", name="training-run")
 config = wandb.config
 config.learning_rate = 0.01
 config.batch_size = 32
-config.epochs = 10
+config.epochs = 1000
 
 # Set random seeds for reproducibility
 def set_seed(seed=42):
@@ -227,7 +227,7 @@ class TripletLoss(nn.Module):
         return loss
 
 # 4. Training Loop
-def train_model(model, train_loader, criterion, optimizer, num_epochs=10):
+def train_model(model, train_loader, criterion, optimizer, num_epochs):
     model.train()
     train_losses = []
     
@@ -330,8 +330,8 @@ def main():
     show_samples(train_dataset)
     
     # Create Siamese pairs
-    train_siamese_dataset = SiamesePairDataset(train_dataset, num_pairs=5000)
-    
+    train_siamese_dataset = SiamesePairDataset(train_dataset, num_pairs=10000)
+
     # Create data loaders
     train_loader = DataLoader(train_siamese_dataset, batch_size=32, shuffle=True, num_workers=4)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
@@ -344,7 +344,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     # Train model
-    train_losses = train_model(model, train_loader, criterion, optimizer, num_epochs=100)
+    train_losses = train_model(model, train_loader, criterion, optimizer, num_epochs=1000)
     
     # Save the model
     torch.save(model.state_dict(), 'siamese_car_model.pth')
