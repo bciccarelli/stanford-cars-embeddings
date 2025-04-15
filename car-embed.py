@@ -19,11 +19,12 @@ import faiss
 import wandb
 
 # Initialize a new run
-wandb.init(project="stanford-cars", name="training-run")
+wandb.init(project="stanford-cars", name="training-run-cosine")
 config = wandb.config
 config.learning_rate = 0.01
 config.batch_size = 32
 config.epochs = 1000
+config.similarity = "cosine"  # Added to track the similarity metric used
 
 # Set random seeds for reproducibility
 def set_seed(seed=42):
@@ -36,7 +37,6 @@ def set_seed(seed=42):
 
 set_seed()
 
-# Download latest version
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
@@ -50,7 +50,6 @@ class StanfordCarsDataset(Dataset):
         self.split = split
         
         # Load annotations
-        # self.annotations_path = os.path.join(path_to_meta, 'cars_annos.mat')
         cars_annos_test = os.path.join(self.path_to_meta, "cars_test_annos_withlabels (1).mat") 
         cars_annos_train = os.path.join(self.path_to_meta, "devkit", "cars_train_annos.mat")
         cars_annos_meta = os.path.join(self.path_to_meta, "devkit", "cars_meta.mat")
@@ -197,32 +196,45 @@ class SiameseNetwork(nn.Module):
         out2 = self.forward_one(x2)
         return out1, out2
 
-# 3. Loss Functions
+# 3. Loss Functions - Modified to use cosine similarity
 class ContrastiveLoss(nn.Module):
-    def __init__(self, margin=1.0):
+    def __init__(self, margin=0.5):
         super(ContrastiveLoss, self).__init__()
         self.margin = margin
     
     def forward(self, output1, output2, label):
-        # Calculate Euclidean distance
-        euclidean_distance = F.pairwise_distance(output1, output2)
+        # Calculate cosine similarity (dot product of normalized vectors)
+        cosine_similarity = torch.sum(output1 * output2, dim=1)
+        
+        # Convert similarity to distance (1 - similarity)
+        # This maps: 1 (identical) -> 0 (no distance), -1 (opposite) -> 2 (max distance)
+        cosine_distance = 1 - cosine_similarity
         
         # Contrastive loss
+        # For similar pairs: minimize distance
+        # For dissimilar pairs: push distance to be at least margin
         loss_contrastive = torch.mean(
-            label * torch.pow(euclidean_distance, 2) + 
-            (1 - label) * torch.pow(torch.clamp(self.margin - euclidean_distance, min=0.0), 2)
+            label * cosine_distance + 
+            (1 - label) * torch.pow(torch.clamp(self.margin - cosine_distance, min=0.0), 2)
         )
         
         return loss_contrastive
 
 class TripletLoss(nn.Module):
-    def __init__(self, margin=1.0):
+    def __init__(self, margin=0.5):
         super(TripletLoss, self).__init__()
         self.margin = margin
     
     def forward(self, anchor, positive, negative):
-        pos_dist = torch.nn.functional.pairwise_distance(anchor, positive)
-        neg_dist = torch.nn.functional.pairwise_distance(anchor, negative)
+        # Calculate cosine similarities
+        pos_sim = torch.sum(anchor * positive, dim=1)
+        neg_sim = torch.sum(anchor * negative, dim=1)
+        
+        # Convert to distances
+        pos_dist = 1 - pos_sim
+        neg_dist = 1 - neg_sim
+        
+        # Triplet loss using cosine distance
         loss = torch.mean(torch.clamp(pos_dist - neg_dist + self.margin, min=0.0))
         return loss
 
@@ -281,18 +293,21 @@ def generate_embeddings(model, data_loader):
     
     return all_embeddings, all_labels
 
-# 6. Nearest Neighbor Search using FAISS
+# 6. Nearest Neighbor Search using FAISS with Cosine Similarity
 def build_index(embeddings):
     dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)  # L2 distance for Euclidean
+    # Use IndexFlatIP for Inner Product, which is equivalent to cosine similarity for normalized vectors
+    index = faiss.IndexFlatIP(dim)
+    # Since our vectors are already normalized in the model, we can use inner product directly
     index.add(embeddings.astype(np.float32))
     return index
 
 def find_similar_cars(index, query_embedding, all_embeddings, all_labels, k=5):
-    distances, indices = index.search(query_embedding.reshape(1, -1).astype(np.float32), k)
+    # For cosine similarity, higher values (closer to 1) are better
+    similarities, indices = index.search(query_embedding.reshape(1, -1).astype(np.float32), k)
     similar_embeddings = [all_embeddings[idx] for idx in indices[0]]
     similar_labels = [all_labels[idx] for idx in indices[0]]
-    return distances[0], indices[0], similar_embeddings, similar_labels
+    return similarities[0], indices[0], similar_embeddings, similar_labels
 
 # Function to display some sample images
 def show_samples(dataset, num_samples=5):
@@ -340,49 +355,35 @@ def main():
     model = SiameseNetwork().to(device)
     
     # Define loss function and optimizer
-    criterion = ContrastiveLoss(margin=1.0)
+    criterion = ContrastiveLoss(margin=0.5)  # Different margin for cosine similarity
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     # Train model
     train_losses = train_model(model, train_loader, criterion, optimizer, num_epochs=1000)
     
+    wandb.finish()
+
     # Save the model
-    torch.save(model.state_dict(), 'siamese_car_model.pth')
-    
-    print("Generating embeddings for the test dataset...")
-    # Generate embeddings for the test dataset
+    torch.save(model.state_dict(), 'siamese_car_model_cosine.pth')
+
+    # Test the model by generating embeddings and creating an index
+    print("Generating embeddings for test dataset...")
     test_embeddings, test_labels = generate_embeddings(model, test_loader)
     
-    # Build FAISS index
+    # Build the index for fast similarity search
+    print("Building FAISS index...")
     index = build_index(test_embeddings)
     
-    # Save embeddings, labels and index
-    with open('car_embeddings.pkl', 'wb') as f:
-        pickle.dump((test_embeddings, test_labels), f)
-    
-    faiss.write_index(index, 'car_index.faiss')
-    
-    # Example of finding similar cars
-    # Get a sample image from the test set
-    sample_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=True)
-    sample_images, sample_labels = next(iter(sample_dataloader))
-    sample_images = sample_images.to(device)
-    
-    # Get embedding for the sample image
-    model.eval()
-    with torch.no_grad():
-        sample_embedding = model.forward_one(sample_images).cpu().numpy()
-    
-    # Find similar cars
-    distances, indices, similar_embeddings, similar_labels = find_similar_cars(
-        index, sample_embedding, test_embeddings, test_labels, k=5
-    )
-    
-    print("Query car label:", sample_labels.item())
-    print("Similar car labels:", similar_labels)
-    print("Distances:", distances)
+    # Example of finding similar cars for the first test image
+    if len(test_embeddings) > 0:
+        query_embedding = test_embeddings[0]
+        similarities, indices, similar_embeddings, similar_labels = find_similar_cars(
+            index, query_embedding, test_embeddings, test_labels
+        )
+        print("Query label:", test_labels[0])
+        print("Similar labels:", similar_labels)
+        print("Similarities (cosine):", similarities)
 
-    wandb.finish()
 
 if __name__ == "__main__":
     main()
