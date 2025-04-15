@@ -15,13 +15,13 @@ import kagglehub
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# Define the SiameseNetwork architecture (same as in training script)
-class SiameseNetwork(nn.Module):
+# Updated to TripletNetwork architecture to match training 
+class TripletNetwork(nn.Module):
     def __init__(self, embedding_dim=128):
-        super(SiameseNetwork, self).__init__()
+        super(TripletNetwork, self).__init__()
         
-        # Load pretrained EfficientNet-B0
-        base_model = models.efficientnet_b0(pretrained=True)
+        # Load pretrained EfficientNet-B1 to match training
+        base_model = models.efficientnet_b1(pretrained=True)
         
         # Remove the classifier
         self.features = nn.Sequential(*list(base_model.children())[:-1])
@@ -29,7 +29,7 @@ class SiameseNetwork(nn.Module):
         # Get the output dimension of the last conv layer
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         
-        # Feature dimension of EfficientNet-B0
+        # Feature dimension of EfficientNet-B1
         feature_dim = 1280
         
         # Embedding layer
@@ -44,14 +44,15 @@ class SiameseNetwork(nn.Module):
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.embedding(x)
-        # L2 normalize the embedding
+        # L2 normalize the embedding for cosine similarity
         x = F.normalize(x, p=2, dim=1)
         return x
     
-    def forward(self, x1, x2):
-        out1 = self.forward_one(x1)
-        out2 = self.forward_one(x2)
-        return out1, out2
+    def forward(self, anchor, positive, negative):
+        anchor_embedding = self.forward_one(anchor)
+        positive_embedding = self.forward_one(positive)
+        negative_embedding = self.forward_one(negative)
+        return anchor_embedding, positive_embedding, negative_embedding
 
 # Function to load and preprocess image
 def load_image(image_path):
@@ -65,12 +66,14 @@ def load_image(image_path):
     img_tensor = transform(img).unsqueeze(0)  # Add batch dimension
     return img_tensor, img
 
-# Find similar cars using FAISS index
+# Updated to explicitly use cosine similarity
 def find_similar_cars(index, query_embedding, all_embeddings, all_labels, k=5):
-    distances, indices = index.search(query_embedding.reshape(1, -1).astype(np.float32), k)
+    # For cosine similarity with normalized vectors, we use IndexFlatIP (inner product)
+    # Higher values (closer to 1) indicate greater similarity
+    similarities, indices = index.search(query_embedding.reshape(1, -1).astype(np.float32), k)
     similar_embeddings = [all_embeddings[idx] for idx in indices[0]]
     similar_labels = [all_labels[idx] for idx in indices[0]]
-    return distances[0], indices[0], similar_embeddings, similar_labels
+    return similarities[0], indices[0], similar_embeddings, similar_labels
 
 # Class to load test dataset (simplified from the original StanfordCarsDataset)
 class StanfordCarsDataset:
@@ -111,8 +114,8 @@ class StanfordCarsDataset:
             
         return img, label
 
-# Function to display query image and similar cars
-def plot_similar_cars(query_img, test_dataset, indices, distances, class_names):
+# Function to display query image and similar cars (updated to use similarities directly)
+def plot_similar_cars(query_img, test_dataset, indices, similarities, class_names):
     plt.figure(figsize=(15, 8))
     
     # Display query image
@@ -133,9 +136,9 @@ def plot_similar_cars(query_img, test_dataset, indices, distances, class_names):
         
         plt.imshow(img)
         
-        # Display car model name and similarity score
+        # Display car model name and similarity score (cosine similarity)
         car_name = class_names[test_dataset.samples[indices[i]][1]]
-        title = f"#{i+1}: {car_name}\nScore: {1 - distances[i]:.2f}"
+        title = f"#{i+1}: {car_name}\nSimilarity: {similarities[i]:.2f}"
         plt.title(title, fontsize=8)
         plt.axis('off')
     
@@ -158,10 +161,9 @@ def main():
     
     path_to_meta = kagglehub.dataset_download("abdelrahmant11/standford-cars-dataset-meta")
     
-    # Model and data paths
-    model_path = 'siamese_car_model.pth'
-    embeddings_path = 'car_embeddings.pkl'
-    index_path = 'car_index.faiss'
+    # Model and data paths - updated to use triplet model
+    model_path = 'triplet_car_model_final.pth'
+    embeddings_path = 'test_embeddings.pkl'
     
     # Check if files exist
     if not os.path.exists(model_path):
@@ -171,22 +173,23 @@ def main():
     if not os.path.exists(embeddings_path):
         print(f"Error: Embeddings path {embeddings_path} does not exist")
         return
-        
-    if not os.path.exists(index_path):
-        print(f"Error: Index path {index_path} does not exist")
-        return
     
-    # Load the trained model
-    model = SiameseNetwork().to(device)
+    # Load the trained triplet model
+    model = TripletNetwork().to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     
     # Load car embeddings and labels
     with open(embeddings_path, 'rb') as f:
-        test_embeddings, test_labels = pickle.load(f)
+        data = pickle.load(f)
+        test_embeddings = data['embeddings']
+        test_labels = data['labels']
     
-    # Load FAISS index
-    index = faiss.read_index(index_path)
+    # Build FAISS index for cosine similarity (using inner product with normalized vectors)
+    print("Building FAISS index for cosine similarity...")
+    dim = test_embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)  # IP = Inner Product for cosine similarity
+    index.add(test_embeddings.astype(np.float32))
     
     # Load and preprocess the query image
     query_tensor, query_img = load_image(query_image_path)
@@ -196,14 +199,14 @@ def main():
     with torch.no_grad():
         query_embedding = model.forward_one(query_tensor).cpu().numpy()
     
-    # Find similar cars
-    distances, indices, similar_embeddings, similar_labels = find_similar_cars(
+    # Find similar cars using cosine similarity
+    similarities, indices, similar_embeddings, similar_labels = find_similar_cars(
         index, query_embedding, test_embeddings, test_labels, k=5
     )
     
     print("Similar car indices:", indices)
     print("Similar car labels:", similar_labels)
-    print("Similarity scores:", [1 - dist for dist in distances])  # Convert distance to similarity score
+    print("Cosine similarities:", similarities)  # These are already similarity scores (higher is better)
     
     # Create transforms for test dataset
     test_transform = transforms.Compose([
@@ -223,8 +226,8 @@ def main():
     # Get class names from the test dataset
     class_names = test_dataset.class_names
     
-    # Plot similar cars
-    plot_similar_cars(query_img, test_dataset, indices, distances, class_names)
+    # Plot similar cars with cosine similarity scores
+    plot_similar_cars(query_img, test_dataset, indices, similarities, class_names)
 
 if __name__ == "__main__":
     main()

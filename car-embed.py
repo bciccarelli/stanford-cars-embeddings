@@ -19,12 +19,14 @@ import faiss
 import wandb
 
 # Initialize a new run
-wandb.init(project="stanford-cars", name="training-run-cosine")
+wandb.init(project="stanford-cars", name="training-run-triplet-cosine")
 config = wandb.config
-config.learning_rate = 0.01
+config.learning_rate = 0.001
 config.batch_size = 32
-config.epochs = 1000
-config.similarity = "cosine"  # Added to track the similarity metric used
+config.epochs = 100
+config.similarity = "cosine"
+config.loss = "triplet"
+config.margin = 0.5
 
 # Set random seeds for reproducibility
 def set_seed(seed=42):
@@ -96,10 +98,11 @@ class StanfordCarsDataset(Dataset):
             
         return img, label
 
-class SiamesePairDataset(Dataset):
-    def __init__(self, dataset, num_pairs=10000):
+# Create a triplet dataset for triplet loss training
+class TripletDataset(Dataset):
+    def __init__(self, dataset, num_triplets=10000):
         self.dataset = dataset
-        self.num_pairs = num_pairs
+        self.num_triplets = num_triplets
         
         # Create a dictionary mapping class IDs to sample indices
         self.label_to_indices = {}
@@ -108,36 +111,43 @@ class SiamesePairDataset(Dataset):
                 self.label_to_indices[label] = []
             self.label_to_indices[label].append(idx)
             
-        self.pairs = self._generate_pairs()
+        # Filter out classes with only one sample
+        self.valid_labels = [label for label, indices in self.label_to_indices.items() 
+                            if len(indices) >= 2]
         
-    def _generate_pairs(self):
-        pairs = []
-        # Generate positive pairs (same class)
-        for _ in range(self.num_pairs // 2):
-            label = random.choice(list(self.label_to_indices.keys()))
-            if len(self.label_to_indices[label]) >= 2:
-                idx1, idx2 = random.sample(self.label_to_indices[label], 2)
-                pairs.append((idx1, idx2, 1))  # 1 indicates same class
-                
-        # Generate negative pairs (different classes)
-        for _ in range(self.num_pairs // 2):
-            label1, label2 = random.sample(list(self.label_to_indices.keys()), 2)
-            idx1 = random.choice(self.label_to_indices[label1])
-            idx2 = random.choice(self.label_to_indices[label2])
-            pairs.append((idx1, idx2, 0))  # 0 indicates different classes
+        self.triplets = self._generate_triplets()
+        
+    def _generate_triplets(self):
+        triplets = []
+        for _ in range(self.num_triplets):
+            # Select anchor class (must have at least 2 samples)
+            anchor_class = random.choice(self.valid_labels)
             
-        random.shuffle(pairs)
-        return pairs
+            # Select anchor and positive (same class)
+            anchor_idx, positive_idx = random.sample(self.label_to_indices[anchor_class], 2)
+            
+            # Select negative class (different from anchor)
+            negative_classes = [label for label in self.valid_labels if label != anchor_class]
+            negative_class = random.choice(negative_classes)
+            
+            # Select negative sample
+            negative_idx = random.choice(self.label_to_indices[negative_class])
+            
+            triplets.append((anchor_idx, positive_idx, negative_idx))
+            
+        return triplets
     
     def __len__(self):
-        return len(self.pairs)
+        return len(self.triplets)
     
     def __getitem__(self, idx):
-        idx1, idx2, label = self.pairs[idx]
-        img1, _ = self.dataset[idx1]
-        img2, _ = self.dataset[idx2]
+        anchor_idx, positive_idx, negative_idx = self.triplets[idx]
         
-        return img1, img2, torch.FloatTensor([label])
+        anchor_img, anchor_label = self.dataset[anchor_idx]
+        positive_img, _ = self.dataset[positive_idx]
+        negative_img, negative_label = self.dataset[negative_idx]
+        
+        return anchor_img, positive_img, negative_img, anchor_label, negative_label
 
 # Define transformations
 def get_transforms():
@@ -158,12 +168,12 @@ def get_transforms():
     
     return train_transform, test_transform
 
-# 2. Model Definition
-class SiameseNetwork(nn.Module):
+# 2. Model Definition for Triplet Network
+class TripletNetwork(nn.Module):
     def __init__(self, embedding_dim=128):
-        super(SiameseNetwork, self).__init__()
+        super(TripletNetwork, self).__init__()
         
-        # Load pretrained EfficientNet-B0
+        # Load pretrained EfficientNet
         base_model = models.efficientnet_b0(pretrained=True)
         
         # Remove the classifier
@@ -172,7 +182,7 @@ class SiameseNetwork(nn.Module):
         # Get the output dimension of the last conv layer
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         
-        # Feature dimension of EfficientNet-B0
+        # Feature dimension of EfficientNet-B1
         feature_dim = 1280
         
         # Embedding layer
@@ -187,58 +197,38 @@ class SiameseNetwork(nn.Module):
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.embedding(x)
-        # L2 normalize the embedding
+        # L2 normalize the embedding for cosine similarity
         x = F.normalize(x, p=2, dim=1)
         return x
     
-    def forward(self, x1, x2):
-        out1 = self.forward_one(x1)
-        out2 = self.forward_one(x2)
-        return out1, out2
+    def forward(self, anchor, positive, negative):
+        anchor_embedding = self.forward_one(anchor)
+        positive_embedding = self.forward_one(positive)
+        negative_embedding = self.forward_one(negative)
+        return anchor_embedding, positive_embedding, negative_embedding
 
-# 3. Loss Functions - Modified to use cosine similarity
-class ContrastiveLoss(nn.Module):
-    def __init__(self, margin=0.5):
-        super(ContrastiveLoss, self).__init__()
-        self.margin = margin
-    
-    def forward(self, output1, output2, label):
-        # Calculate cosine similarity (dot product of normalized vectors)
-        cosine_similarity = torch.sum(output1 * output2, dim=1)
-        
-        # Convert similarity to distance (1 - similarity)
-        # This maps: 1 (identical) -> 0 (no distance), -1 (opposite) -> 2 (max distance)
-        cosine_distance = 1 - cosine_similarity
-        
-        # Contrastive loss
-        # For similar pairs: minimize distance
-        # For dissimilar pairs: push distance to be at least margin
-        loss_contrastive = torch.mean(
-            label * cosine_distance + 
-            (1 - label) * torch.pow(torch.clamp(self.margin - cosine_distance, min=0.0), 2)
-        )
-        
-        return loss_contrastive
-
+# 3. Triplet Loss with Cosine Similarity
 class TripletLoss(nn.Module):
     def __init__(self, margin=0.5):
         super(TripletLoss, self).__init__()
         self.margin = margin
     
     def forward(self, anchor, positive, negative):
-        # Calculate cosine similarities
+        # Calculate cosine similarities (dot product of normalized vectors)
         pos_sim = torch.sum(anchor * positive, dim=1)
         neg_sim = torch.sum(anchor * negative, dim=1)
         
-        # Convert to distances
+        # Convert to distances (1 - similarity)
+        # This maps: 1 (identical) -> 0 (no distance), -1 (opposite) -> 2 (max distance)
         pos_dist = 1 - pos_sim
         neg_dist = 1 - neg_sim
         
-        # Triplet loss using cosine distance
-        loss = torch.mean(torch.clamp(pos_dist - neg_dist + self.margin, min=0.0))
-        return loss
+        # Triplet loss: d(anchor, positive) - d(anchor, negative) + margin
+        # We want d(anchor, positive) to be smaller than d(anchor, negative)
+        losses = torch.relu(pos_dist - neg_dist + self.margin)
+        return losses.mean()
 
-# 4. Training Loop
+# 4. Training Loop for Triplet Network
 def train_model(model, train_loader, criterion, optimizer, num_epochs):
     model.train()
     train_losses = []
@@ -247,17 +237,20 @@ def train_model(model, train_loader, criterion, optimizer, num_epochs):
         running_loss = 0.0
         progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
         
-        for batch_idx, (img1, img2, label) in enumerate(progress_bar):
-            img1, img2, label = img1.to(device), img2.to(device), label.to(device)
+        for batch_idx, (anchor, positive, negative, _, _) in enumerate(progress_bar):
+            # Move to device
+            anchor = anchor.to(device)
+            positive = positive.to(device)
+            negative = negative.to(device)
             
             # Zero the parameter gradients
             optimizer.zero_grad()
             
             # Forward pass
-            output1, output2 = model(img1, img2)
+            anchor_embedding, positive_embedding, negative_embedding = model(anchor, positive, negative)
             
             # Calculate loss
-            loss = criterion(output1, output2, label)
+            loss = criterion(anchor_embedding, positive_embedding, negative_embedding)
             
             # Backward pass and optimize
             loss.backward()
@@ -272,6 +265,10 @@ def train_model(model, train_loader, criterion, optimizer, num_epochs):
         train_losses.append(epoch_loss)
         wandb.log({"loss": epoch_loss, "epoch": epoch})
         print(f'Epoch {epoch+1}, Loss: {epoch_loss:.4f}')
+        
+        # Save model checkpoint periodically
+        if (epoch + 1) % 100 == 0:
+            torch.save(model.state_dict(), f'triplet_car_model_epoch_{epoch+1}.pth')
     
     return train_losses
 
@@ -296,9 +293,9 @@ def generate_embeddings(model, data_loader):
 # 6. Nearest Neighbor Search using FAISS with Cosine Similarity
 def build_index(embeddings):
     dim = embeddings.shape[1]
-    # Use IndexFlatIP for Inner Product, which is equivalent to cosine similarity for normalized vectors
+    # Use IndexFlatIP for Inner Product, which is equivalent to cosine similarity 
+    # for normalized vectors (which is what our model outputs)
     index = faiss.IndexFlatIP(dim)
-    # Since our vectors are already normalized in the model, we can use inner product directly
     index.add(embeddings.astype(np.float32))
     return index
 
@@ -308,23 +305,6 @@ def find_similar_cars(index, query_embedding, all_embeddings, all_labels, k=5):
     similar_embeddings = [all_embeddings[idx] for idx in indices[0]]
     similar_labels = [all_labels[idx] for idx in indices[0]]
     return similarities[0], indices[0], similar_embeddings, similar_labels
-
-# Function to display some sample images
-def show_samples(dataset, num_samples=5):
-    fig, axes = plt.subplots(1, num_samples, figsize=(15, 3))
-    for i in range(num_samples):
-        idx = random.randint(0, len(dataset)-1)
-        img, label = dataset[idx]
-        img = img.permute(1, 2, 0).numpy()
-        img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
-        img = np.clip(img, 0, 1)
-        
-        axes[i].imshow(img)
-        axes[i].set_title(f"Class: {label}")
-        axes[i].axis('off')
-    plt.tight_layout()
-    plt.show()
-
 
 # Main execution
 def main():
@@ -341,30 +321,27 @@ def main():
     train_dataset = StanfordCarsDataset(path_to_stanford_cars, path_to_meta, split='train', transform=train_transform)
     test_dataset = StanfordCarsDataset(path_to_stanford_cars, path_to_meta, split='test', transform=test_transform)
     
-    # Show some sample images
-    show_samples(train_dataset)
+    # Create Triplet dataset
+    train_triplet_dataset = TripletDataset(train_dataset, num_triplets=10000)
     
-    # Create Siamese pairs
-    train_siamese_dataset = SiamesePairDataset(train_dataset, num_pairs=10000)
-
     # Create data loaders
-    train_loader = DataLoader(train_siamese_dataset, batch_size=32, shuffle=True, num_workers=4)
+    train_loader = DataLoader(train_triplet_dataset, batch_size=32, shuffle=True, num_workers=4)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
     
     # Initialize model
-    model = SiameseNetwork().to(device)
+    model = TripletNetwork().to(device)
     
     # Define loss function and optimizer
-    criterion = ContrastiveLoss(margin=0.5)  # Different margin for cosine similarity
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = TripletLoss(margin=config.margin)
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     
     # Train model
-    train_losses = train_model(model, train_loader, criterion, optimizer, num_epochs=1000)
+    train_losses = train_model(model, train_loader, criterion, optimizer, num_epochs=config.epochs)
     
     wandb.finish()
 
-    # Save the model
-    torch.save(model.state_dict(), 'siamese_car_model_cosine.pth')
+    # Save the final model
+    torch.save(model.state_dict(), 'triplet_car_model_final.pth')
 
     # Test the model by generating embeddings and creating an index
     print("Generating embeddings for test dataset...")
@@ -383,6 +360,10 @@ def main():
         print("Query label:", test_labels[0])
         print("Similar labels:", similar_labels)
         print("Similarities (cosine):", similarities)
+        
+    # Save embeddings and labels for later use
+    with open('test_embeddings.pkl', 'wb') as f:
+        pickle.dump({'embeddings': test_embeddings, 'labels': test_labels}, f)
 
 
 if __name__ == "__main__":
