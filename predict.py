@@ -143,12 +143,12 @@ def plot_similar_cars(query_img, test_dataset, indices, similarities, class_name
         plt.axis('off')
     
     plt.tight_layout()
-    plt.savefig('similar_suv.png', dpi=300)
+    plt.savefig('assets/similar_suv.png', dpi=300)
     plt.show()
 
 def main():
     # Fixed query image path
-    query_image_path = "suv.png"
+    query_image_path = "assets/suv.png"
     
     # Check if query image exists
     if not os.path.exists(query_image_path):

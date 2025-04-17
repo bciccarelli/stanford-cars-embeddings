@@ -9,16 +9,16 @@ This project trains a Siamese network on the Stanford Cars Dataset to learn a co
 ## Example Usage
 
 ### BMW Query  
-![BMW Query Image](bmw.png)
+![BMW Query Image](assets/bmw.png)
 
 ### Recommended Similar BMWs  
-![Similar BMWs](similar_bmw.png)
+![Similar BMWs](assets/similar_bmw.png)
 
 ### SUV Query  
-![SUV Query Image](suv.png)
+![SUV Query Image](assets/suv.png)
 
 ### Recommended Similar SUVs  
-![Similar SUVs](similar_suv.png)
+![Similar SUVs](assets/similar_suv.png)
 
 ## Installation
 
