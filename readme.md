@@ -1,4 +1,4 @@
-# siamese-car-embeddings
+# stanford-car-embeddings
 
 A repository implementing a Siamese network with EfficientNet-B0 to learn embeddings for car images and recommend visually similar vehicles.
 
