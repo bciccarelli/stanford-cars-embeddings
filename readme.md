@@ -9,15 +9,9 @@ This project trains a Siamese network on the Stanford Cars Dataset using triplet
 ## Example Usage
 
 ### BMW Query  
-![BMW Query Image](assets/bmw.png)
-
-### Recommended Similar BMWs  
 ![Similar BMWs](assets/similar_bmw.png)
 
-### SUV Query  
-![SUV Query Image](assets/suv.png)
-
-### Recommended Similar SUVs  
+### SUV Query 
 ![Similar SUVs](assets/similar_suv.png)
 
 ## Usage
