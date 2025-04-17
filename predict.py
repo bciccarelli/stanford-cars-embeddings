@@ -20,8 +20,8 @@ class TripletNetwork(nn.Module):
     def __init__(self, embedding_dim=128):
         super(TripletNetwork, self).__init__()
         
-        # Load pretrained EfficientNet-B1 to match training
-        base_model = models.efficientnet_b1(pretrained=True)
+        # Load pretrained EfficientNet-B0 to match training
+        base_model = models.efficientnet_b0(pretrained=True)
         
         # Remove the classifier
         self.features = nn.Sequential(*list(base_model.children())[:-1])
@@ -29,7 +29,7 @@ class TripletNetwork(nn.Module):
         # Get the output dimension of the last conv layer
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         
-        # Feature dimension of EfficientNet-B1
+        # Feature dimension of EfficientNet-B0
         feature_dim = 1280
         
         # Embedding layer
@@ -143,12 +143,12 @@ def plot_similar_cars(query_img, test_dataset, indices, similarities, class_name
         plt.axis('off')
     
     plt.tight_layout()
-    plt.savefig('similar_cars.png', dpi=300)
+    plt.savefig('similar_suv.png', dpi=300)
     plt.show()
 
 def main():
     # Fixed query image path
-    query_image_path = "car.png"
+    query_image_path = "suv.png"
     
     # Check if query image exists
     if not os.path.exists(query_image_path):
