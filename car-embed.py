@@ -182,7 +182,7 @@ class TripletNetwork(nn.Module):
         # Get the output dimension of the last conv layer
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         
-        # Feature dimension of EfficientNet-B1
+        # Feature dimension of EfficientNet-B0
         feature_dim = 1280
         
         # Embedding layer
